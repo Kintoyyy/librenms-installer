@@ -242,6 +242,16 @@ cat > /etc/nginx/sites-available/librenms.conf <<EOF
 server {
     listen 80;
     server_name ${LIBRENMS_DOMAIN};
+    
+    # Cloudflare tunnel headers (HTTPS termination on separate VM)
+    real_ip_header CF-Connecting-IP;
+    set_real_ip_from 0.0.0.0/0;
+    
+    # Tell Laravel it's HTTPS (from Cloudflare tunnel)
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Host \$host;
+    
     root /opt/librenms/html;
     index index.php;
     location / {
@@ -250,6 +260,10 @@ server {
     location ~ \.php\$ {
         fastcgi_pass unix:${PHP_SOCKET};
         include fastcgi.conf;
+        # Pass Cloudflare headers to PHP-FPM
+        fastcgi_param HTTP_X_FORWARDED_PROTO \$http_x_forwarded_proto;
+        fastcgi_param HTTP_X_FORWARDED_FOR \$http_x_forwarded_for;
+        fastcgi_param HTTP_X_FORWARDED_HOST \$http_x_forwarded_host;
     }
     location ~ /\.ht { deny all; }
 }
