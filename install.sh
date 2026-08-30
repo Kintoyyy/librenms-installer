@@ -284,26 +284,27 @@ success "Copied cron and logrotate configs and enabled the scheduler"
 banner "Updating .env file"
 ENV_FILE=/opt/librenms/.env
 
-# 1) Set database connection details
-if grep -q '^DB_PASSWORD=' "$ENV_FILE"; then
-  sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_PASSWORD}|" "$ENV_FILE"
-else
-  sed -i '/^DB_USERNAME=/a DB_PASSWORD='"${DB_PASSWORD}" "$ENV_FILE"
-fi
+# Helper function to set/update .env values
+set_env() {
+  local key="$1"
+  local value="$2"
+  if grep -q "^${key}=" "$ENV_FILE"; then
+    sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+  else
+    echo "${key}=${value}" >> "$ENV_FILE"
+  fi
+}
 
-# 2) Ensure DB_HOST, DB_PORT, DB_DATABASE are set
-sed -i "s|^DB_HOST=.*|DB_HOST=localhost|" "$ENV_FILE"
-sed -i "s|^DB_PORT=.*|DB_PORT=3306|" "$ENV_FILE"
-sed -i "s|^DB_DATABASE=.*|DB_DATABASE=librenms|" "$ENV_FILE"
-sed -i "s|^DB_USERNAME=.*|DB_USERNAME=librenms|" "$ENV_FILE"
-sed -i "s|^DB_CONNECTION=.*|DB_CONNECTION=mysql|" "$ENV_FILE"
+# Set all database configuration
+set_env "DB_CONNECTION" "mysql"
+set_env "DB_HOST" "localhost"
+set_env "DB_PORT" "3306"
+set_env "DB_DATABASE" "librenms"
+set_env "DB_USERNAME" "librenms"
+set_env "DB_PASSWORD" "${DB_PASSWORD}"
 
-# 3) Set APP_URL (HTTP since SSL is via Cloudflare tunnel)
-if grep -q '^#APP_URL=' "$ENV_FILE"; then
-  sed -i "s|^#APP_URL=.*|APP_URL=http://${LIBRENMS_DOMAIN}|" "$ENV_FILE"
-else
-  echo "APP_URL=http://${LIBRENMS_DOMAIN}" >> "$ENV_FILE"
-fi
+# Set APP_URL (HTTP since SSL is via Cloudflare tunnel)
+set_env "APP_URL" "http://${LIBRENMS_DOMAIN}"
 
 success ".env file updated with database credentials and APP_URL"
 
@@ -314,12 +315,23 @@ systemctl daemon-reload
 systemctl restart mariadb php${PHP_VER}-fpm nginx snmpd
 success "All services up"
 
-# Wait for MariaDB to be fully ready
-sleep 3
+# Wait for MariaDB to be fully ready and accepting connections
+echo "⏳ Waiting for MariaDB to be ready..."
+for i in {1..30}; do
+  if mysql -uroot -e "SELECT 1" &>/dev/null; then
+    success "MariaDB is ready"
+    break
+  fi
+  sleep 1
+  if [[ $i -eq 30 ]]; then
+    error "MariaDB failed to start after 30 seconds"
+    exit 1
+  fi
+done
 
 # === 🗄️ Run Database Migrations ===
 banner "Running Database Migrations"
-su -s /bin/bash librenms -c 'cd /opt/librenms && php artisan migrate --force --no-interaction' || true
+su -s /bin/bash librenms -c 'cd /opt/librenms && php artisan migrate --force --no-interaction'
 success "Database migrations completed"
 
 # === 🔗 Updating binary links ===
