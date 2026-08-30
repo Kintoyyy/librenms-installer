@@ -14,7 +14,7 @@
 # Non-interactive DevOps variables:
 #   LIBRENMS_DOMAIN, DB_PASSWORD, SNMP_COMMUNITY, TZ, PHP_VER,
 #   USE_UTF8_LOCALES
-#  credits: https://github.com/straytripod/LibreNMS-Install
+# 
 # NOTE: SSL/HTTPS is handled via Cloudflare tunnel on separate VM
 # ==============================================================
 
@@ -280,18 +280,32 @@ systemctl daemon-reload
 sudo systemctl start librenms-scheduler.timer
 success "Copied cron and logrotate configs and enabled the scheduler"
 
-# === 📝 Update .env file with APP_URL ===
+# === 📝 Update .env file with DB credentials & APP_URL ===
 banner "Updating .env file"
 ENV_FILE=/opt/librenms/.env
 
-# 1) Uncomment the placeholder and set APP_URL (HTTP since SSL is via Cloudflare tunnel)
+# 1) Set database connection details
+if grep -q '^DB_PASSWORD=' "$ENV_FILE"; then
+  sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_PASSWORD}|" "$ENV_FILE"
+else
+  sed -i '/^DB_USERNAME=/a DB_PASSWORD='"${DB_PASSWORD}" "$ENV_FILE"
+fi
+
+# 2) Ensure DB_HOST, DB_PORT, DB_DATABASE are set
+sed -i "s|^DB_HOST=.*|DB_HOST=localhost|" "$ENV_FILE"
+sed -i "s|^DB_PORT=.*|DB_PORT=3306|" "$ENV_FILE"
+sed -i "s|^DB_DATABASE=.*|DB_DATABASE=librenms|" "$ENV_FILE"
+sed -i "s|^DB_USERNAME=.*|DB_USERNAME=librenms|" "$ENV_FILE"
+sed -i "s|^DB_CONNECTION=.*|DB_CONNECTION=mysql|" "$ENV_FILE"
+
+# 3) Set APP_URL (HTTP since SSL is via Cloudflare tunnel)
 if grep -q '^#APP_URL=' "$ENV_FILE"; then
   sed -i "s|^#APP_URL=.*|APP_URL=http://${LIBRENMS_DOMAIN}|" "$ENV_FILE"
 else
-  echo -e "\nAPP_URL=http://${LIBRENMS_DOMAIN}" >> "$ENV_FILE"
+  echo "APP_URL=http://${LIBRENMS_DOMAIN}" >> "$ENV_FILE"
 fi
 
-success ".env file updated with APP_URL"
+success ".env file updated with database credentials and APP_URL"
 
 # === 🔁 Enable & Restart Services ===
 banner "Enabling & Restarting Services"
@@ -299,6 +313,14 @@ systemctl enable mariadb php${PHP_VER}-fpm nginx snmpd
 systemctl daemon-reload
 systemctl restart mariadb php${PHP_VER}-fpm nginx snmpd
 success "All services up"
+
+# Wait for MariaDB to be fully ready
+sleep 3
+
+# === 🗄️ Run Database Migrations ===
+banner "Running Database Migrations"
+su -s /bin/bash librenms -c 'cd /opt/librenms && php artisan migrate --force --no-interaction' || true
+success "Database migrations completed"
 
 # === 🔗 Updating binary links ===
 banner "🔗 Linking LibreNMS CLI (lnms)"
