@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 # ==============================================================
-# 🌐 LibreNMS Installer Script
-# Target: Ubuntu 24.04 Minimal
+# 🌐 LibreNMS Installer Script (Official Docs)
+# Target: Ubuntu 24.04 / Debian 12+
+# 
+# Follows: https://docs.librenms.org/Installation/Install-LibreNMS/
 # 
 # Installs and configures LibreNMS end-to-end:
-#  • Detects or installs required packages (PHP, MySQL, Nginx, SNMP, etc.)
-#  • Creates librenms user, clones repo, sets ACLs
-#  • Installs Composer deps, configures MariaDB (DB + user + charset)
-#  • Sets up PHP-FPM pool, Nginx vhost (HTTP only, no SSL)
-#  • Deploys SNMP agent, cron jobs, logrotate, systemd scheduler
-#  • Updates .env with APP_URL
+#  • Installs required packages (PHP 8.5+, MySQL, Nginx, SNMP)
+#  • Creates librenms user with proper ACLs
+#  • Clones official repo, installs Composer deps
+#  • Configures MariaDB with proper charset/collation
+#  • Sets up PHP-FPM pool with Unix socket
+#  • Configures Nginx (HTTP only - SSL via Cloudflare tunnel on separate VM)
+#  • Deploys SNMP, cron jobs, logrotate, scheduler
+#  • Prompts for trusted proxy IPs (Cloudflare tunnel network)
 # 
-# Non-interactive DevOps variables:
-#   LIBRENMS_DOMAIN, DB_PASSWORD, SNMP_COMMUNITY, TZ, PHP_VER,
-#   USE_UTF8_LOCALES
-# 
-# NOTE: SSL/HTTPS is handled via Cloudflare tunnel on separate VM
+# Non-interactive variables (set before running):
+#   LIBRENMS_DOMAIN, DB_PASSWORD, SNMP_COMMUNITY, TZ, TRUSTED_PROXIES
 # ==============================================================
 
-# --- Fail early, strict shell settings ---
 set -euo pipefail
 IFS=$'\n\t'
 trap 'echo "✖ Error at line $LINENO"; exit 1' ERR
 
-# --- Ensure running as root ---
+# Ensure running as root
 if [[ $EUID -ne 0 ]]; then
   echo "✖ Please run as root or via sudo."
   exit 1
@@ -48,37 +48,24 @@ LIBRENMS_DOMAIN="${LIBRENMS_DOMAIN:-}"
 DB_PASSWORD="${DB_PASSWORD:-}"
 SNMP_COMMUNITY="${SNMP_COMMUNITY:-}"
 TZ="${TZ:-}"
-PHP_VER="${PHP_VER:-}"
-USE_UTF8_LOCALES="${USE_UTF8_LOCALES:-yes}"
-TRUSTED_PROXIES="${TRUSTED_PROXIES:-127.0.0.1}"
+TRUSTED_PROXIES="${TRUSTED_PROXIES:-}"
 
-# === 📥 PROMPTS IF VARIABLES NOT SET ===
+# === 📥 PROMPTS ===
 [[ -z "$LIBRENMS_DOMAIN" ]] && read -rp "Enter LibreNMS domain or IP: " LIBRENMS_DOMAIN
-[[ -z "$DB_PASSWORD" ]]     && { DB_PASSWORD=$(openssl rand -hex 16); echo -e "${YEL}Generated DB password: $DB_PASSWORD${RST}"; }
-[[ -z "$SNMP_COMMUNITY" ]]  && read -rp "Enter SNMP community [public]: " SNMP_COMMUNITY && SNMP_COMMUNITY=${SNMP_COMMUNITY:-public}
+[[ -z "$DB_PASSWORD" ]] && { DB_PASSWORD=$(openssl rand -hex 16); echo -e "${YEL}Generated DB password: $DB_PASSWORD${RST}"; }
+[[ -z "$SNMP_COMMUNITY" ]] && read -rp "Enter SNMP community [public]: " SNMP_COMMUNITY && SNMP_COMMUNITY=${SNMP_COMMUNITY:-public}
+
 if [[ -z "$TZ" ]]; then
   echo -e "${CYN}Refer to timezone list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones${RST}"
-  read -rp "Enter timezone (e.g. America/Phoenix): " TZ
-  timedatectl set-timezone "$TZ"
-fi
-
-if [[ -z "$PHP_VER" ]]; then
-  if [[ -d /etc/php ]]; then
-    PHP_VER=$(ls /etc/php | grep -E '^[0-9]+\.[0-9]+' | sort -Vr | head -n1)
-  else
-    PHP_VER="8.4"
-    echo -e "${YEL}⚠ No PHP found; defaulting to PHP $PHP_VER.${RST}"
-  fi
+  read -rp "Enter timezone (e.g. Asia/Manila): " TZ
 fi
 
 # Trusted Reverse Proxies Configuration
 echo -e "\n${CYN}Trusted Reverse Proxy Configuration${RST}"
-echo "This restricts which IPs can set forwarded headers (security critical)"
+echo "This restricts which IPs can set X-Forwarded headers (security critical)"
 
-# Detect current machine's IP and subnet
 CURRENT_IP=$(hostname -I | awk '{print $1}')
 if [[ -n "$CURRENT_IP" ]]; then
-  # Calculate subnet (assumes /24 for most networks)
   CURRENT_SUBNET=$(echo "$CURRENT_IP" | sed 's/\.[0-9]*$/.0\/24/')
   echo -e "\n${GRN}Detected this machine's IP: $CURRENT_IP${RST}"
   echo -e "${GRN}Suggested subnet: $CURRENT_SUBNET${RST}"
@@ -88,10 +75,10 @@ fi
 
 echo "Options:"
 echo "  1. Localhost only (most secure): 127.0.0.1"
-echo "  2. Current subnet (Cloudflare tunnel VM on same network): $CURRENT_SUBNET"
-echo "  3. Specific IP (e.g. Cloudflare tunnel on different network): 192.168.1.50"
-echo "  4. Multiple IPs/ranges: 192.168.1.50,10.0.0.0/8"
-echo "  WARNING: Do NOT use '*' or '**' in production - they are insecure"
+echo "  2. Current subnet (Cloudflare tunnel on same network): $CURRENT_SUBNET"
+echo "  3. Specific IP (Cloudflare tunnel on different network): 192.168.1.50"
+echo "  4. Cloudflare IP range: 172.67.169.0/24"
+echo "  WARNING: Do NOT use '*' or '**' in production"
 read -rp "Enter trusted proxy IPs/CIDR (leave blank for $CURRENT_SUBNET): " TRUSTED_PROXIES_INPUT
 if [[ -n "$TRUSTED_PROXIES_INPUT" ]]; then
   TRUSTED_PROXIES="$TRUSTED_PROXIES_INPUT"
@@ -101,269 +88,207 @@ else
   echo -e "${GRN}Using current subnet: $TRUSTED_PROXIES${RST}"
 fi
 
-# === 🚨 Nuke Existing Installation Prompt ===
+# === 🚨 Nuke Existing Installation ===
 if [[ -d /opt/librenms ]] || mysql -uroot -e "USE librenms;" &>/dev/null; then
   echo -e "\n${YEL}Existing LibreNMS detected!${RST}"
-  echo "This will remove:"
-  echo "  • /opt/librenms"
-  echo "  • MariaDB librenms DB & user"
-  echo "  • Nginx librenms site"
-  echo "  • PHP-FPM pool"
-  echo "  • SNMP config & agent script"
-  echo "  • Cron & logrotate entries"
   read -rp "Proceed to nuke and start fresh? [y/N]: " CONFIRM
   if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-    echo "Aborting—existing installation preserved."
+    echo "Aborting."
     exit 1
   fi
 
   echo "⏳ Removing old installation..."
-  rm -rf /opt/librenms \
-         /etc/nginx/sites-available/librenms.conf \
-         /etc/nginx/sites-enabled/librenms.conf \
-         /etc/php/${PHP_VER}/fpm/pool.d/librenms.conf \
-         /etc/snmp/snmpd.conf /usr/bin/distro \
-         /etc/cron.d/librenms /etc/logrotate.d/librenms
-
-  echo "⏳ Dropping database..."
+  systemctl stop nginx php-fpm mariadb snmpd 2>/dev/null || true
+  rm -rf /opt/librenms /etc/nginx/conf.d/librenms.conf /etc/php-fpm.d/librenms.conf
   mysql -uroot <<SQL
 DROP DATABASE IF EXISTS librenms;
 DROP USER IF EXISTS 'librenms'@'localhost';
 FLUSH PRIVILEGES;
 SQL
-
-  success "Previous LibreNMS installation nuked."
+  success "Previous installation removed."
 fi
 
-# === 🧱 INSTALL BASE PACKAGES ===
+# === 🧱 INSTALL PACKAGES ===
 banner "Installing Required Packages"
 export DEBIAN_FRONTEND=noninteractive
 
-apt update -y \
-  && apt full-upgrade -y \
-  && apt install -y software-properties-common
+apt update -y && apt full-upgrade -y
 
-if [[ "$USE_UTF8_LOCALES" == "yes" ]]; then
-  LC_ALL=C.UTF-8 add-apt-repository -y universe
-  LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
-else
-  add-apt-repository -y universe
-  add-apt-repository -y ppa:ondrej/php
-fi
+# Install Debian Sury PHP repo (for PHP 8.5+)
+apt install -y lsb-release ca-certificates curl
+curl -sSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb
+dpkg -i /tmp/debsuryorg-archive-keyring.deb
+echo "deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/php.list
+apt update -y
 
-# clang all-in-one to minimize cache reloads
-PACKAGES=(acl composer curl fping git graphviz imagemagick mariadb-client \
-  mariadb-server mtr-tiny nginx-full nmap cron \
-  php${PHP_VER}-{cli,curl,fpm,gd,gmp,mbstring,mysql,snmp,xml,zip} \
-  python3-{pip,pymysql,psutil,setuptools,systemd,venv,dotenv,redis} \
-  python3-command-runner rrdtool snmp snmpd whois unzip traceroute)
+# Install all required packages
+apt install -y acl curl fping git mariadb-client mariadb-server mtr-tiny nginx-full nmap php8.5-cli php8.5-curl php8.5-fpm php8.5-gd php8.5-gmp php8.5-mbstring php8.5-mysql php8.5-snmp php8.5-xml php8.5-zip python3-dotenv python3-pip python3-psutil python3-pymysql python3-redis python3-setuptools python3-systemd rrdtool snmp snmpd traceroute unzip whois
 
-apt install -y "${PACKAGES[@]}"
+success "Packages installed"
 
-#enable cron for ubuntu minimal
-systemctl enable cron
-systemctl start cron
-success "Base packages installed"
-
-# === 👤 Create librenms user ===
-banner "Creating LibreNMS User"
+# === 👤 CREATE LIBRENMS USER ===
+banner "Creating librenms User"
 if id librenms &>/dev/null; then
-  skip "User 'librenms' exists"
+  skip "User librenms exists"
 else
   useradd librenms -d /opt/librenms -M -r -s "$(which bash)"
-  success "User 'librenms' created"
+  success "User librenms created"
 fi
 
-# === 📦 Clone LibreNMS ===
-banner "Cloning LibreNMS Code"
-repo_dir=/opt/librenms
-if [[ -d "$repo_dir" ]]; then
-  skip "$repo_dir exists, skipping clone"
-else
-  git clone https://github.com/librenms/librenms.git "$repo_dir"
-  success "Repository cloned"
-fi
+# === 📦 CLONE REPO ===
+banner "Cloning LibreNMS Repository"
+cd /opt
+git clone https://github.com/librenms/librenms.git
+success "Repository cloned"
 
+# === 🔐 SET PERMISSIONS ===
+banner "Setting Permissions"
 chown -R librenms:librenms /opt/librenms
 chmod 771 /opt/librenms
-setfacl -d -m g::rwx /opt/librenms/{rrd,logs,bootstrap/cache,storage} || true
-setfacl -R -m g::rwx /opt/librenms/{rrd,logs,bootstrap/cache,storage} || true
-success "Permissions set on /opt/librenms"
+setfacl -d -m g::rwx /opt/librenms/rrd /opt/librenms/logs /opt/librenms/bootstrap/cache/ /opt/librenms/storage/
+setfacl -R -m g::rwx /opt/librenms/rrd /opt/librenms/logs /opt/librenms/bootstrap/cache/ /opt/librenms/storage/
+success "Permissions set"
 
-# verify html directory
-if [[ ! -f /opt/librenms/html/index.php ]]; then
-  error "Missing html/index.php after clone!"
-  exit 1
-fi
-
-# === 💾 PHP Composer Dependencies ===
+# === 💾 INSTALL COMPOSER DEPS ===
 banner "Installing PHP Dependencies"
-su -s /bin/bash librenms -c '/opt/librenms/scripts/composer_wrapper.php install --no-dev || true'
+su - librenms -s /bin/bash -c '/opt/librenms/scripts/composer_wrapper.php install --no-dev'
 success "PHP dependencies installed"
 
-# === 🛢️ MariaDB Setup ===
+# === 🌍 SET TIMEZONE ===
+banner "Setting Timezone"
+timedatectl set-timezone "$TZ"
+sed -i "s|^;date.timezone =|date.timezone = $TZ|" /etc/php/8.5/fpm/php.ini
+sed -i "s|^;date.timezone =|date.timezone = $TZ|" /etc/php/8.5/cli/php.ini
+success "Timezone set to $TZ"
+
+# === 🛢️ CONFIGURE MARIADB ===
 banner "Configuring MariaDB"
-if ! mysql -uroot -e "USE librenms;" &>/dev/null; then
-  mysql -uroot <<MYSQL
+sed -i '/\[mysqld\]/a innodb_file_per_table=1\nlower_case_table_names=0' /etc/mysql/mariadb.conf.d/50-server.cnf
+systemctl enable mariadb
+systemctl restart mariadb
+sleep 2
+
+mysql -uroot <<MYSQL
 CREATE DATABASE librenms CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER 'librenms'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
 GRANT ALL PRIVILEGES ON librenms.* TO 'librenms'@'localhost';
 FLUSH PRIVILEGES;
 MYSQL
-  success "Database & user created"
-else
-  skip "Database 'librenms' exists, skipping"
-fi
-
-# apply innodb settings
-sed -i '/\[mysqld\]/a innodb_file_per_table=1' /etc/mysql/mariadb.conf.d/50-server.cnf
-sed -i '/\[mysqld\]/a lower_case_table_names=0'   /etc/mysql/mariadb.conf.d/50-server.cnf
-systemctl enable mariadb
-systemctl daemon-reload
-systemctl restart mariadb
 success "MariaDB configured"
 
-# === 🐘 PHP-FPM Pool Configuration ===
-banner "Configuring PHP-FPM Pool"
+# === 🐘 CONFIGURE PHP-FPM ===
+banner "Configuring PHP-FPM"
+cp /etc/php/8.5/fpm/pool.d/www.conf /etc/php/8.5/fpm/pool.d/librenms.conf
 
-# 1) Remove any stale LibreNMS socket
-rm -f /run/php-fpm-librenms.sock || true
+sed -i \
+  -e 's/\[www\]/[librenms]/' \
+  -e 's/user = www-data/user = librenms/' \
+  -e 's/group = www-data/group = librenms/' \
+  -e 's|listen = .*|listen = /run/php-fpm-librenms.sock|' \
+  /etc/php/8.5/fpm/pool.d/librenms.conf
 
-# 2) Ensure the standard PHP socket dir exists and is owned by librenms
-mkdir -p /run/php
-chown librenms:librenms /run/php
+systemctl enable php8.5-fpm
+systemctl restart php8.5-fpm
+success "PHP-FPM configured"
 
-conf_dir="/etc/php/$PHP_VER/fpm/pool.d"
-lib_conf="$conf_dir/librenms.conf"
-
-if [[ ! -f "$lib_conf" ]]; then
-  cp "$conf_dir/www.conf" "$lib_conf"
-  # 3) Point to a unique socket name under /run/php/
-  sed -i \
-    -e 's/\[www\]/[librenms]/' \
-    -e 's/user = www-data/user = librenms/' \
-    -e 's/group = www-data/group = librenms/' \
-    -e 's|listen = .*|listen = /run/php/php'"${PHP_VER//./}"'-fpm-librenms.sock|' \
-    "$lib_conf"
-  success "PHP-FPM pool created"
-else
-  skip "PHP-FPM pool exists"
-fi
-
-# 4) Apply timezone into PHP INI if missing
-for ini in fpm/php.ini cli/php.ini; do
-  file="/etc/php/$PHP_VER/$ini"
-  grep -q "date.timezone = $TZ" "$file" || \
-    sed -i "/;date.timezone =/a date.timezone = $TZ" "$file"
-done
-
-# 5) Enable & restart the service
-systemctl enable php${PHP_VER}-fpm
-systemctl daemon-reload
-systemctl restart php${PHP_VER}-fpm
-success "PHP-FPM restarted and running on socket: /run/php/php${PHP_VER//./}-fpm-librenms.sock"
-
-# define the socket path for Nginx
-PHP_SOCKET="/run/php/php${PHP_VER//./}-fpm-librenms.sock"
-
-# === 🌐 NGINX Config (HTTP only - SSL via Cloudflare tunnel) ===
+# === 🌐 CONFIGURE NGINX ===
 banner "Configuring NGINX"
 
-cat > /etc/nginx/sites-available/librenms.conf <<EOF
+cat > /etc/nginx/conf.d/librenms.conf <<'NGINX_EOF'
 server {
-    listen 80;
-    server_name ${LIBRENMS_DOMAIN};
-    
-    # Cloudflare tunnel headers (HTTPS termination on separate VM)
-    real_ip_header CF-Connecting-IP;
-    set_real_ip_from 0.0.0.0/0;
-    
-    # Tell Laravel it's HTTPS (from Cloudflare tunnel)
-    proxy_set_header X-Forwarded-Proto https;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Host \$host;
-    
-    root /opt/librenms/html;
-    index index.php;
-    location / {
-        try_files \$uri \$uri/ /index.php?\$query_string;
-    }
-    location ~ \.php\$ {
-        fastcgi_pass unix:${PHP_SOCKET};
-        include fastcgi.conf;
-        # Pass Cloudflare headers to PHP-FPM
-        fastcgi_param HTTP_X_FORWARDED_PROTO \$http_x_forwarded_proto;
-        fastcgi_param HTTP_X_FORWARDED_FOR \$http_x_forwarded_for;
-        fastcgi_param HTTP_X_FORWARDED_HOST \$http_x_forwarded_host;
-    }
-    location ~ /\.ht { deny all; }
+ listen      80;
+ server_name LIBRENMS_DOMAIN;
+ root        /opt/librenms/html;
+ index       index.php;
+
+ charset utf-8;
+ gzip on;
+ gzip_types text/css application/javascript text/javascript application/x-javascript image/svg+xml text/plain text/xsd text/xsl text/xml image/x-icon;
+ 
+ # Cloudflare tunnel headers (HTTPS termination on separate VM)
+ real_ip_header CF-Connecting-IP;
+ set_real_ip_from 0.0.0.0/0;
+ 
+ # Security headers
+ add_header Referrer-Policy "same-origin" always;
+ add_header X-Content-Type-Options "nosniff" always;
+ add_header X-Frame-Options "SAMEORIGIN" always;
+ 
+ location / {
+  try_files $uri $uri/ /index.php?$query_string;
+ }
+ location ~ [^/]\.php(/|$) {
+  fastcgi_pass unix:/run/php-fpm-librenms.sock;
+  fastcgi_split_path_info ^(.+\.php)(/.+)$;
+  include fastcgi.conf;
+  
+  # Tell PHP it's HTTPS (from Cloudflare tunnel)
+  fastcgi_param HTTPS on;
+  fastcgi_param SERVER_PORT 443;
+  fastcgi_param HTTP_X_FORWARDED_PROTO https;
+  fastcgi_param HTTP_X_FORWARDED_FOR $proxy_add_x_forwarded_for;
+  fastcgi_param HTTP_X_FORWARDED_HOST $host;
+ }
+ location ~ /\.(?!well-known).* {
+  deny all;
+ }
 }
-EOF
+NGINX_EOF
 
-ln -sf /etc/nginx/sites-available/librenms.conf /etc/nginx/sites-enabled/
-rm -f /etc/nginx/sites-enabled/default
-systemctl daemon-reload
-nginx -t && systemctl enable nginx && systemctl reload nginx
-success "NGINX configured (HTTP on port 80)"
+sed -i "s|LIBRENMS_DOMAIN|$LIBRENMS_DOMAIN|g" /etc/nginx/conf.d/librenms.conf
 
-# === 📟 SNMP Setup ===
+rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default
+systemctl enable nginx
+systemctl restart nginx
+success "NGINX configured"
+
+# === 📟 CONFIGURE SNMP ===
 banner "Configuring SNMP"
 cp /opt/librenms/snmpd.conf.example /etc/snmp/snmpd.conf
 sed -i "s/RANDOMSTRINGGOESHERE/$SNMP_COMMUNITY/" /etc/snmp/snmpd.conf
 curl -s -o /usr/bin/distro https://raw.githubusercontent.com/librenms/librenms-agent/master/snmp/distro
 chmod +x /usr/bin/distro
-systemctl enable --now snmpd
-success "SNMP ready"
+systemctl enable snmpd
+systemctl restart snmpd
+success "SNMP configured"
 
-# === 🕓 CRON, LOGROTATE and Scheduler ===
-banner "CRON, LOGROTATE and Scheduler"
-cp /opt/librenms/dist/librenms.cron     /etc/cron.d/librenms
+# === 🕐 CRON, LOGROTATE, SCHEDULER ===
+banner "Configuring Cron, Logrotate & Scheduler"
+cp /opt/librenms/dist/librenms.cron /etc/cron.d/librenms
 cp /opt/librenms/misc/librenms.logrotate /etc/logrotate.d/librenms
-cp /opt/librenms/dist/librenms-scheduler.service /opt/librenms/dist/librenms-scheduler.timer /etc/systemd/system/
-sudo systemctl enable librenms-scheduler.timer
+cp /opt/librenms/dist/librenms-scheduler.{service,timer} /etc/systemd/system/
+systemctl enable librenms-scheduler.timer
 systemctl daemon-reload
-sudo systemctl start librenms-scheduler.timer
-success "Copied cron and logrotate configs and enabled the scheduler"
+systemctl start librenms-scheduler.timer
+success "Cron, logrotate & scheduler configured"
 
-# === 📝 Update .env file with DB credentials & APP_URL ===
-banner "Updating .env file"
-ENV_FILE=/opt/librenms/.env
+# === 🔗 ENABLE LNMS COMMAND ===
+banner "Enabling lnms Command"
+ln -sf /opt/librenms/lnms /usr/bin/lnms
+cp /opt/librenms/misc/lnms-completion.bash /etc/bash_completion.d/
+success "lnms command enabled"
 
-# Helper function to set/update .env values
-set_env() {
-  local key="$1"
-  local value="$2"
-  if grep -q "^${key}=" "$ENV_FILE"; then
-    sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
-  else
-    echo "${key}=${value}" >> "$ENV_FILE"
-  fi
-}
+# === 📝 CREATE .ENV FILE ===
+banner "Creating .env File"
+cat > /opt/librenms/.env <<ENV_EOF
+APP_KEY=base64:$(openssl rand -base64 32)
+APP_URL=https://${LIBRENMS_DOMAIN}
+APP_DEBUG=false
+APP_TRUSTED_PROXIES=${TRUSTED_PROXIES}
+DB_CONNECTION=mysql
+DB_HOST=localhost
+DB_PORT=3306
+DB_DATABASE=librenms
+DB_USERNAME=librenms
+DB_PASSWORD=${DB_PASSWORD}
+ENV_EOF
 
-# Set all database configuration
-set_env "DB_CONNECTION" "mysql"
-set_env "DB_HOST" "localhost"
-set_env "DB_PORT" "3306"
-set_env "DB_DATABASE" "librenms"
-set_env "DB_USERNAME" "librenms"
-set_env "DB_PASSWORD" "${DB_PASSWORD}"
+chown librenms:librenms /opt/librenms/.env
+chmod 600 /opt/librenms/.env
+success ".env file created"
 
-# Set APP_URL (HTTP since SSL is via Cloudflare tunnel)
-set_env "APP_URL" "http://${LIBRENMS_DOMAIN}"
-
-# Configure trusted reverse proxies (security critical)
-set_env "APP_TRUSTED_PROXIES" "${TRUSTED_PROXIES}"
-
-success ".env file updated with database credentials, APP_URL, and secure proxy settings (${TRUSTED_PROXIES})"
-
-# === 🔁 Enable & Restart Services ===
-banner "Enabling & Restarting Services"
-systemctl enable mariadb php${PHP_VER}-fpm nginx snmpd
-systemctl daemon-reload
-systemctl restart mariadb php${PHP_VER}-fpm nginx snmpd
-success "All services up"
-
-# Wait for MariaDB to be fully ready and accepting connections
+# === 🗄️ RUN DATABASE MIGRATIONS ===
+banner "Running Database Migrations"
 echo "⏳ Waiting for MariaDB to be ready..."
 for i in {1..30}; do
   if mysql -uroot -e "SELECT 1" &>/dev/null; then
@@ -372,47 +297,34 @@ for i in {1..30}; do
   fi
   sleep 1
   if [[ $i -eq 30 ]]; then
-    error "MariaDB failed to start after 30 seconds"
+    error "MariaDB failed to start"
     exit 1
   fi
 done
 
-# === 🗄️ Run Database Migrations ===
-banner "Running Database Migrations"
-su -s /bin/bash librenms -c 'cd /opt/librenms && php artisan migrate --force --no-interaction'
+# Clear cache first
+rm -rf /opt/librenms/bootstrap/cache/* /opt/librenms/storage/framework/cache/* /opt/librenms/storage/framework/views/*
+chown -R librenms:librenms /opt/librenms/bootstrap /opt/librenms/storage
+
+su - librenms -s /bin/bash -c 'cd /opt/librenms && php artisan migrate --force --no-interaction'
 success "Database migrations completed"
-
-# === 🔗 Updating binary links ===
-banner "🔗 Linking LibreNMS CLI (lnms)"
-
-# Fix lnms symlink only if missing or wrong
-if [[ ! -L /usr/local/bin/lnms || "$(readlink -f /usr/local/bin/lnms)" != "/opt/librenms/lnms" ]]; then
-  sudo ln -sf /opt/librenms/lnms /usr/local/bin/lnms
-  sudo chmod +x /opt/librenms/lnms
-  echo "🔗 lnms symlink created/updated."
-else
-  echo "✅ lnms symlink already correct."
-fi
-
-# Always copy bash completion
-sudo cp /opt/librenms/misc/lnms-completion.bash /etc/bash_completion.d/
-echo "📋 Bash completion script installed."
-
-success "Binary links updated"
 
 # === ✅ COMPLETE ===
 banner "LibreNMS Installation Complete"
-echo -e "\n${GRN}✔ LibreNMS is running on HTTP at: http://${LIBRENMS_DOMAIN}/install${RST}"
-echo -e "🌐 Access via Cloudflare tunnel on your separate VM${RST}"
-echo -e "\n🔐 MySQL user: librenms"
-echo -e "🔑 MySQL password: ${YEL}${DB_PASSWORD}${RST}"
-echo -e "🛰️ SNMP Community: ${YEL}${SNMP_COMMUNITY}${RST}"
-echo -e "🔒 Trusted Proxies: ${YEL}${TRUSTED_PROXIES}${RST}"
-echo -e "\n🔧 Cloudflare Tunnel Setup:"
-echo -e "  On your separate VM, tunnel port 80 of this host to your domain"
-echo -e "  Example cloudflared config: http://${LIBRENMS_DOMAIN}:80"
-echo -e "\n📝 IMPORTANT - Trusted Proxies:"
-echo -e "  If you changed the default (127.0.0.1), make sure:"
-echo -e "  1. The IP/CIDR matches your Cloudflare tunnel VM"
-echo -e "  2. Do NOT use '*' or '**' in production (insecure)"
-echo -e "\n🚀 Then finish the web-UI setup at your tunneled URL."
+echo -e "\n${GRN}✔ LibreNMS is ready for web installer${RST}"
+echo -e "\n📍 Access the web installer at:"
+echo -e "   ${GRN}https://${LIBRENMS_DOMAIN}/install${RST}"
+echo -e "\n🔐 Database Credentials:"
+echo -e "   User: librenms"
+echo -e "   Password: ${YEL}${DB_PASSWORD}${RST}"
+echo -e "\n🛰️  SNMP Community: ${YEL}${SNMP_COMMUNITY}${RST}"
+echo -e "\n🔒 Trusted Proxies: ${YEL}${TRUSTED_PROXIES}${RST}"
+echo -e "\n🌐 Cloudflare Tunnel Setup:"
+echo -e "   On your separate VM, tunnel to:"
+echo -e "   ${CYN}http://${LIBRENMS_DOMAIN}:80${RST}"
+echo -e "\n📋 Next Steps:"
+echo -e "   1. Access https://${LIBRENMS_DOMAIN}/install"
+echo -e "   2. Create admin user and finish setup (DB already migrated)"
+echo -e "   3. Add your first device"
+echo -e "\n📚 Documentation:"
+echo -e "   https://docs.librenms.org/Installation/Install-LibreNMS/"
