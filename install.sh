@@ -89,7 +89,7 @@ else
 fi
 
 # === 🚨 Nuke Existing Installation ===
-if [[ -d /opt/librenms ]] || mysql -uroot -e "USE librenms;" &>/dev/null; then
+if [[ -d /opt/librenms ]]; then
   echo -e "\n${YEL}Existing LibreNMS detected!${RST}"
   read -rp "Proceed to nuke and start fresh? [y/N]: " CONFIRM
   if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
@@ -98,8 +98,14 @@ if [[ -d /opt/librenms ]] || mysql -uroot -e "USE librenms;" &>/dev/null; then
   fi
 
   echo "⏳ Removing old installation..."
-  systemctl stop nginx php-fpm mariadb snmpd 2>/dev/null || true
-  rm -rf /opt/librenms /etc/nginx/conf.d/librenms.conf /etc/php-fpm.d/librenms.conf
+  systemctl stop nginx php8.5-fpm mariadb snmpd 2>/dev/null || true
+  sleep 2
+  
+  rm -rf /opt/librenms /etc/nginx/conf.d/librenms.conf /etc/php-fpm.d/librenms.conf /etc/php/8.5/fpm/pool.d/librenms.conf
+  
+  # Start MariaDB to drop the database
+  systemctl start mariadb
+  sleep 2
   mysql -uroot <<SQL
 DROP DATABASE IF EXISTS librenms;
 DROP USER IF EXISTS 'librenms'@'localhost';
