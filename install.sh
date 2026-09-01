@@ -47,7 +47,7 @@ error()   { echo -e "${RED}✖ ${1}${RST}" >&2; }
 LIBRENMS_DOMAIN="${LIBRENMS_DOMAIN:-}"
 DB_PASSWORD="${DB_PASSWORD:-}"
 SNMP_COMMUNITY="${SNMP_COMMUNITY:-}"
-TZ="${TZ:-}"
+TZ="${TZ:-Asia/Manila}"
 TRUSTED_PROXIES="${TRUSTED_PROXIES:-}"
 
 # === 📥 PROMPTS ===
@@ -55,9 +55,10 @@ TRUSTED_PROXIES="${TRUSTED_PROXIES:-}"
 [[ -z "$DB_PASSWORD" ]] && { DB_PASSWORD=$(openssl rand -hex 16); echo -e "${YEL}Generated DB password: $DB_PASSWORD${RST}"; }
 [[ -z "$SNMP_COMMUNITY" ]] && read -rp "Enter SNMP community [public]: " SNMP_COMMUNITY && SNMP_COMMUNITY=${SNMP_COMMUNITY:-public}
 
-if [[ -z "$TZ" ]]; then
-  echo -e "${CYN}Refer to timezone list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones${RST}"
-  read -rp "Enter timezone (e.g. Asia/Manila): " TZ
+if [[ "$TZ" == "Asia/Manila" ]]; then
+  echo -e "${GRN}Using default timezone: Asia/Manila${RST}"
+else
+  echo -e "Timezone: $TZ"
 fi
 
 # Trusted Reverse Proxies Configuration
