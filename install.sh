@@ -50,6 +50,7 @@ SNMP_COMMUNITY="${SNMP_COMMUNITY:-}"
 TZ="${TZ:-}"
 PHP_VER="${PHP_VER:-}"
 USE_UTF8_LOCALES="${USE_UTF8_LOCALES:-yes}"
+TRUSTED_PROXIES="${TRUSTED_PROXIES:-127.0.0.1}"
 
 # === 📥 PROMPTS IF VARIABLES NOT SET ===
 [[ -z "$LIBRENMS_DOMAIN" ]] && read -rp "Enter LibreNMS domain or IP: " LIBRENMS_DOMAIN
@@ -68,6 +69,36 @@ if [[ -z "$PHP_VER" ]]; then
     PHP_VER="8.4"
     echo -e "${YEL}⚠ No PHP found; defaulting to PHP $PHP_VER.${RST}"
   fi
+fi
+
+# Trusted Reverse Proxies Configuration
+echo -e "\n${CYN}Trusted Reverse Proxy Configuration${RST}"
+echo "This restricts which IPs can set forwarded headers (security critical)"
+
+# Detect current machine's IP and subnet
+CURRENT_IP=$(hostname -I | awk '{print $1}')
+if [[ -n "$CURRENT_IP" ]]; then
+  # Calculate subnet (assumes /24 for most networks)
+  CURRENT_SUBNET=$(echo "$CURRENT_IP" | sed 's/\.[0-9]*$/.0\/24/')
+  echo -e "\n${GRN}Detected this machine's IP: $CURRENT_IP${RST}"
+  echo -e "${GRN}Suggested subnet: $CURRENT_SUBNET${RST}"
+else
+  CURRENT_SUBNET="127.0.0.1"
+fi
+
+echo "Options:"
+echo "  1. Localhost only (most secure): 127.0.0.1"
+echo "  2. Current subnet (Cloudflare tunnel VM on same network): $CURRENT_SUBNET"
+echo "  3. Specific IP (e.g. Cloudflare tunnel on different network): 192.168.1.50"
+echo "  4. Multiple IPs/ranges: 192.168.1.50,10.0.0.0/8"
+echo "  WARNING: Do NOT use '*' or '**' in production - they are insecure"
+read -rp "Enter trusted proxy IPs/CIDR (leave blank for $CURRENT_SUBNET): " TRUSTED_PROXIES_INPUT
+if [[ -n "$TRUSTED_PROXIES_INPUT" ]]; then
+  TRUSTED_PROXIES="$TRUSTED_PROXIES_INPUT"
+  echo -e "${GRN}Trusted proxies set to: $TRUSTED_PROXIES${RST}"
+else
+  TRUSTED_PROXIES="$CURRENT_SUBNET"
+  echo -e "${GRN}Using current subnet: $TRUSTED_PROXIES${RST}"
 fi
 
 # === 🚨 Nuke Existing Installation Prompt ===
@@ -320,7 +351,10 @@ set_env "DB_PASSWORD" "${DB_PASSWORD}"
 # Set APP_URL (HTTP since SSL is via Cloudflare tunnel)
 set_env "APP_URL" "http://${LIBRENMS_DOMAIN}"
 
-success ".env file updated with database credentials and APP_URL"
+# Configure trusted reverse proxies (security critical)
+set_env "APP_TRUSTED_PROXIES" "${TRUSTED_PROXIES}"
+
+success ".env file updated with database credentials, APP_URL, and secure proxy settings (${TRUSTED_PROXIES})"
 
 # === 🔁 Enable & Restart Services ===
 banner "Enabling & Restarting Services"
@@ -373,7 +407,12 @@ echo -e "🌐 Access via Cloudflare tunnel on your separate VM${RST}"
 echo -e "\n🔐 MySQL user: librenms"
 echo -e "🔑 MySQL password: ${YEL}${DB_PASSWORD}${RST}"
 echo -e "🛰️ SNMP Community: ${YEL}${SNMP_COMMUNITY}${RST}"
+echo -e "🔒 Trusted Proxies: ${YEL}${TRUSTED_PROXIES}${RST}"
 echo -e "\n🔧 Cloudflare Tunnel Setup:"
 echo -e "  On your separate VM, tunnel port 80 of this host to your domain"
 echo -e "  Example cloudflared config: http://${LIBRENMS_DOMAIN}:80"
+echo -e "\n📝 IMPORTANT - Trusted Proxies:"
+echo -e "  If you changed the default (127.0.0.1), make sure:"
+echo -e "  1. The IP/CIDR matches your Cloudflare tunnel VM"
+echo -e "  2. Do NOT use '*' or '**' in production (insecure)"
 echo -e "\n🚀 Then finish the web-UI setup at your tunneled URL."
