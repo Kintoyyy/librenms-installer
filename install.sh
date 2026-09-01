@@ -282,6 +282,7 @@ APP_KEY=base64:$(openssl rand -base64 32)
 APP_URL=https://${LIBRENMS_DOMAIN}
 APP_DEBUG=false
 APP_TRUSTED_PROXIES=${TRUSTED_PROXIES}
+SESSION_SECURE_COOKIE=true
 DB_CONNECTION=mysql
 DB_HOST=localhost
 DB_PORT=3306
@@ -293,6 +294,10 @@ ENV_EOF
 chown librenms:librenms /opt/librenms/.env
 chmod 600 /opt/librenms/.env
 success ".env file created"
+
+# Clear cache and cache config with SESSION_SECURE_COOKIE
+rm -rf /opt/librenms/bootstrap/cache/* /opt/librenms/storage/framework/cache/* 2>/dev/null || true
+su - librenms -s /bin/bash -c 'lnms config:cache'
 
 # === 🗄️ RUN DATABASE MIGRATIONS ===
 banner "Running Database Migrations"
@@ -316,22 +321,40 @@ chown -R librenms:librenms /opt/librenms/bootstrap /opt/librenms/storage
 su - librenms -s /bin/bash -c 'cd /opt/librenms && php artisan migrate --force --no-interaction'
 success "Database migrations completed"
 
+# === 👤 CREATE ADMIN USER ===
+banner "Creating Admin User"
+ADMIN_PASSWORD=$(openssl rand -base64 12)
+su - librenms -s /bin/bash -c "php /opt/librenms/lnms user:add --password='${ADMIN_PASSWORD}' --role=admin --email=admin@${LIBRENMS_DOMAIN} admin" || true
+success "Admin user created"
+
+# === ⚙️ FINAL CONFIGURATION ===
+banner "Finalizing Configuration"
+su - librenms -s /bin/bash -c 'lnms config:set distributed_poller true'
+success "Distributed poller enabled"
+
+su - librenms -s /bin/bash -c 'lnms config:cache'
+success "Config cache updated with all settings"
+
+su - librenms -s /bin/bash -c 'cd /opt/librenms && ./scripts/github-remove -s'
+success "GitHub references removed"
+
 # === ✅ COMPLETE ===
 banner "LibreNMS Installation Complete"
-echo -e "\n${GRN}✔ LibreNMS is ready for web installer${RST}"
-echo -e "\n📍 Access the web installer at:"
-echo -e "   ${GRN}https://${LIBRENMS_DOMAIN}/install${RST}"
-echo -e "\n🔐 Database Credentials:"
-echo -e "   User: librenms"
-echo -e "   Password: ${YEL}${DB_PASSWORD}${RST}"
-echo -e "\n🛰️  SNMP Community: ${YEL}${SNMP_COMMUNITY}${RST}"
-echo -e "\n🔒 Trusted Proxies: ${YEL}${TRUSTED_PROXIES}${RST}"
+echo -e "\n${GRN}✔ LibreNMS is ready to use${RST}"
+echo -e "\n📍 Access LibreNMS at:"
+echo -e "   ${GRN}https://${LIBRENMS_DOMAIN}${RST}"
+echo -e "\n👤 Admin Credentials:"
+echo -e "   Username: ${YEL}admin${RST}"
+echo -e "   Password: ${YEL}${ADMIN_PASSWORD}${RST}"
+echo -e "\n🔐 Database User: librenms"
+echo -e "🛰️  SNMP Community: ${YEL}${SNMP_COMMUNITY}${RST}"
+echo -e "🔒 Trusted Proxies: ${YEL}${TRUSTED_PROXIES}${RST}"
 echo -e "\n🌐 Cloudflare Tunnel Setup:"
 echo -e "   On your separate VM, tunnel to:"
 echo -e "   ${CYN}http://${LIBRENMS_DOMAIN}:80${RST}"
 echo -e "\n📋 Next Steps:"
-echo -e "   1. Access https://${LIBRENMS_DOMAIN}/install"
-echo -e "   2. Create admin user and finish setup (DB already migrated)"
-echo -e "   3. Add your first device"
+echo -e "   1. Log in with credentials above"
+echo -e "   2. Add your first device"
+echo -e "   3. Configure alerting and monitoring"
 echo -e "\n📚 Documentation:"
 echo -e "   https://docs.librenms.org/Installation/Install-LibreNMS/"
